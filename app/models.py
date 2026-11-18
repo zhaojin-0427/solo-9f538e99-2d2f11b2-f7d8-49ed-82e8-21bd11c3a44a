@@ -70,3 +70,41 @@ class RevisionResult(BaseModel):
         default=None,
         description="Most recent valid revision still readable while the current one is invalid",
     )
+
+
+class ChangeCell(BaseModel):
+    lon: int = Field(
+        ...,
+        description="Integer longitude of the cell's western edge; "
+        "the cell spans [lon, lon+1) degrees",
+    )
+    lat: int = Field(
+        ...,
+        description="Integer latitude of the cell's southern edge; "
+        "the cell spans [lat, lat+1) degrees",
+    )
+
+
+class ChangeGroup(BaseModel):
+    group_id: int = Field(
+        ...,
+        description="Monotonically increasing cursor; committed groups are "
+        "gapless and ordered by commit",
+    )
+    relation_id: int
+    revision: int = Field(..., description="Revision this group was committed with")
+    cells: list[ChangeCell] = Field(
+        ...,
+        description="1° grid cells whose water coverage changed by a positive "
+        "area; empty when the served face did not change",
+    )
+    created_at: str
+
+
+class ChangeStream(BaseModel):
+    groups: list[ChangeGroup]
+    next_cursor: int = Field(
+        ...,
+        description="Pass as `after` on the next call to continue the stream; "
+        "equals the last returned group_id, or `after` when no group is returned",
+    )

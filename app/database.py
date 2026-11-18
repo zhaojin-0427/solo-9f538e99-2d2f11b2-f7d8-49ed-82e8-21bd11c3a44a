@@ -1,4 +1,4 @@
-"""SQLite-backed revision storage.
+"""SQLite-backed revision storage and revision change stream.
 
 Durability and concurrency contract:
 
@@ -11,7 +11,14 @@ Durability and concurrency contract:
   a failed transaction rolls back completely, so storage errors can
   never leave a half revision;
 * raw input and computed state are stored together, therefore a reader
-  of any revision sees input, geometry and status from the same commit.
+  of any revision sees input, geometry and status from the same commit;
+* every stored revision is paired with exactly one *change group* (the
+  1°-grid cells whose water coverage changed) written in the **same**
+  transaction, so the change stream can never miss a revision, hold a
+  half group, or disagree with the serving state — including after
+  rollbacks and restarts.  Group ids are assigned in commit order
+  (writers are serialised) and rolled-back inserts consume no id, so
+  committed groups form a gapless cursor sequence.
 """
 
 from __future__ import annotations
@@ -20,22 +27,36 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS revisions (
-    relation_id          INTEGER NOT NULL,
-    revision             INTEGER NOT NULL,
-    status               TEXT    NOT NULL CHECK (status IN ('valid', 'invalid')),
-    input_json           TEXT    NOT NULL,
-    geometry_json        TEXT,
-    error_code           TEXT,
-    error_message        TEXT,
-    error_way_ids_json   TEXT,
-    created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (relation_id, revision)
-);
-"""
+SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS revisions (
+        relation_id          INTEGER NOT NULL,
+        revision             INTEGER NOT NULL,
+        status               TEXT    NOT NULL CHECK (status IN ('valid', 'invalid')),
+        input_json           TEXT    NOT NULL,
+        geometry_json        TEXT,
+        error_code           TEXT,
+        error_message        TEXT,
+        error_way_ids_json   TEXT,
+        created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (relation_id, revision)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS change_groups (
+        group_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+        relation_id  INTEGER NOT NULL,
+        revision     INTEGER NOT NULL,
+        cells_json   TEXT    NOT NULL,
+        created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (relation_id, revision),
+        FOREIGN KEY (relation_id, revision)
+            REFERENCES revisions (relation_id, revision)
+    )
+    """,
+)
 
 # No in-process lock is needed on purpose: SQLite's own BEGIN IMMEDIATE
 # write lock serialises writers (across threads AND processes, e.g.
@@ -76,7 +97,8 @@ class Database:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(SCHEMA)
+                for statement in SCHEMA_STATEMENTS:
+                    conn.execute(statement)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -91,10 +113,20 @@ class Database:
         input_payload: dict,
         geometry: dict | None,
         error: dict | None,
-    ) -> None:
-        """Atomically persist one full revision.
+        *,
+        change_cells_fn: Callable[[dict | None], list[dict]] | None = None,
+    ) -> int:
+        """Atomically persist one full revision and its change group.
 
-        Raises :class:`RevisionConflict` when ``revision`` is not strictly
+        ``change_cells_fn`` is called *inside* the write transaction with
+        the previously latest stored revision row (or ``None``) and must
+        return the 1°-grid cells whose coverage changed; computing it
+        under the write lock guarantees the recorded diff matches the
+        committed revision sequence even under concurrent uploads.  The
+        change group commits or rolls back together with the revision.
+
+        Returns the new change-group id.  Raises
+        :class:`RevisionConflict` when ``revision`` is not strictly
         greater than every existing revision of the relation.
         """
         with self._connect() as conn:
@@ -113,17 +145,20 @@ class Database:
                         continue
                     raise
             try:
-                row = conn.execute(
-                    "SELECT MAX(revision) AS max_rev FROM revisions WHERE relation_id = ?",
+                prev_row = conn.execute(
+                    "SELECT * FROM revisions WHERE relation_id = ? "
+                    "ORDER BY revision DESC LIMIT 1",
                     (relation_id,),
                 ).fetchone()
-                max_rev = row["max_rev"]
-                if max_rev is not None and revision <= max_rev:
+                if prev_row is not None and revision <= prev_row["revision"]:
                     conn.rollback()
                     raise RevisionConflict(
-                        f"revision {revision} is not greater than the latest revision {max_rev}",
-                        latest=max_rev,
+                        f"revision {revision} is not greater than the latest "
+                        f"revision {prev_row['revision']}",
+                        latest=prev_row["revision"],
                     )
+                previous = self._row_to_dict(prev_row) if prev_row is not None else None
+                cells = change_cells_fn(previous) if change_cells_fn is not None else []
                 conn.execute(
                     """
                     INSERT INTO revisions (
@@ -142,7 +177,20 @@ class Database:
                         json.dumps(error["way_ids"]) if error else None,
                     ),
                 )
+                cursor = conn.execute(
+                    """
+                    INSERT INTO change_groups (relation_id, revision, cells_json)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        relation_id,
+                        revision,
+                        json.dumps(cells, separators=(",", ":")),
+                    ),
+                )
+                group_id = cursor.lastrowid
                 conn.commit()
+                return group_id
             except RevisionConflict:
                 raise
             except Exception:
@@ -203,6 +251,42 @@ class Database:
                 (relation_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # --------------------------------------------------------- change stream
+    @staticmethod
+    def _group_row_to_dict(row: sqlite3.Row) -> dict:
+        return {
+            "group_id": row["group_id"],
+            "relation_id": row["relation_id"],
+            "revision": row["revision"],
+            "cells": json.loads(row["cells_json"]),
+            "created_at": row["created_at"],
+        }
+
+    def get_change_groups(self, after: int = 0, limit: int = 100) -> list[dict]:
+        """Committed change groups with ``group_id > after``, oldest first.
+
+        Runs on a plain WAL read connection, so it never blocks writers
+        and only ever observes fully committed groups.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM change_groups WHERE group_id > ? "
+                "ORDER BY group_id LIMIT ?",
+                (after, limit),
+            ).fetchall()
+            return [self._group_row_to_dict(r) for r in rows]
+
+    def get_change_group_for_revision(
+        self, relation_id: int, revision: int
+    ) -> dict | None:
+        """The single change group belonging to one stored revision."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM change_groups WHERE relation_id = ? AND revision = ?",
+                (relation_id, revision),
+            ).fetchone()
+            return self._group_row_to_dict(row) if row else None
 
 
 class RevisionConflict(Exception):

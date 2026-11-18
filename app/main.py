@@ -6,13 +6,14 @@ import os
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .changes import changed_cells, serving_geometry
 from .database import Database, RevisionConflict
 from .geometry import GeometryError, build_polygon_geojson
-from .models import RevisionIn, RevisionResult
+from .models import ChangeStream, RevisionIn, RevisionResult
 
 def _database_path() -> str:
     # Read lazily so tests (and redeployed env) can override FLOOD_DB_PATH.
@@ -33,7 +34,10 @@ app = FastAPI(
         "Submit complete, incrementing revisions of an OSM water relation "
         "(nodes + unordered outer/inner ways). Valid revisions become a "
         "GeoJSON Polygon; invalid revisions retain their raw input and an "
-        "error, while the last valid polygon keeps being served."
+        "error, while the last valid polygon keeps being served. Every "
+        "accepted upload also commits a change group listing the 1° grid "
+        "cells whose water coverage changed, readable as a cursor stream "
+        "via GET /changes."
     ),
 )
 
@@ -91,6 +95,12 @@ def upload_revision(relation_id: int, payload: RevisionIn, request: Request) -> 
             input_payload=payload.model_dump(),
             geometry=geometry,
             error=error,
+            # Evaluated inside the write transaction against the revision
+            # that was latest at commit time, so the recorded change group
+            # always matches the committed serving-state transition.
+            change_cells_fn=lambda previous: changed_cells(
+                serving_geometry(previous), geometry
+            ),
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -111,6 +121,36 @@ def upload_revision(relation_id: int, payload: RevisionIn, request: Request) -> 
         error=error,
         last_valid_revision=last_valid["revision"] if last_valid else None,
     )
+
+
+@app.get(
+    "/changes",
+    response_model=ChangeStream,
+    tags=["changes"],
+    summary="Read the revision change stream for the 1° raster cache",
+)
+def read_changes(
+    request: Request,
+    after: int = Query(
+        default=0,
+        ge=0,
+        description="Cursor: only groups with group_id greater than this are returned",
+    ),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> ChangeStream:
+    """Change groups committed by revision uploads, oldest first.
+
+    Each accepted upload commits exactly one group (possibly with an
+    empty ``cells`` list) in the same transaction as its revision, so
+    the stream never misses or splits a group and always agrees with the
+    serving state.  A cell is listed when its water coverage changed by
+    a positive area; inner rings and edge-only contact never count as
+    coverage.  Poll with ``after=next_cursor`` until an empty page is
+    returned.
+    """
+    groups = _db(request).get_change_groups(after=after, limit=limit)
+    next_cursor = groups[-1]["group_id"] if groups else after
+    return ChangeStream(groups=groups, next_cursor=next_cursor)
 
 
 @app.get(
